@@ -1,0 +1,7 @@
+aiohttp
+aiosqlite
+discord.py
+pillow
+pytz
+python-dotenv
+TikTokLive
