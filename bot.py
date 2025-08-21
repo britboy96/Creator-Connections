@@ -265,17 +265,33 @@ async def rotate_single_holder_role(guild: discord.Guild, role: discord.Role, wi
 # ------------------- TikTok Handling -------------------
 async def start_tiktok(guild: discord.Guild):
     cfg = await get_guild_cfg(guild.id)
+
+    # Ensure TikTok username exists and is cleaned
     username = cfg.get("tiktok_username")
+    if not username:
+        raise RuntimeError("❌ No TikTok username set. Use `/toktrack <username>` first.")
+    username = str(username).strip().lstrip("@")
+
+    # Ensure target channel exists
     channel_id = cfg.get("channel_id")
-    if not username or not channel_id:
-        raise RuntimeError("TikTok username or target channel not configured.")
+    if not channel_id:
+        raise RuntimeError("❌ No target channel set. Use `/set_target_channel #channel` first.")
+
+    # Stop old client if one exists
     await stop_tiktok(guild)
 
-    client = TikTokLiveClient(unique_id=username)
+    try:
+        client = TikTokLiveClient(unique_id=username)
+    except Exception as e:
+        raise RuntimeError(f"Failed to create TikTok client for @{username}: {e}")
+
     running_clients[guild.id] = client
     live_gifters[guild.id] = {}
     live_commenters[guild.id] = {}
     live_likers[guild.id] = {}
+
+    # ... rest of your event hooks remain unchanged
+
 
     async def open_session():
         async with aiosqlite.connect(DB_PATH) as db:
@@ -625,5 +641,6 @@ async def on_ready():
 
 if __name__ == "__main__":
     if not BOT_TOKEN:
-        raise SystemExit("Missing DISCORD_BOT_TOKEN in environment")
+        raise SystemExit("❌ Missing DISCORD_BOT_TOKEN in environment")
+    print("DISCORD_BOT_TOKEN loaded?", bool(BOT_TOKEN))
     bot.run(BOT_TOKEN)
