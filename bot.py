@@ -290,19 +290,16 @@ async def start_tiktok(guild: discord.Guild):
     live_commenters[guild.id] = {}
     live_likers[guild.id] = {}
 
-    # ... rest of your event hooks remain unchanged
-
-
     async def open_session():
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
                 "INSERT INTO live_session (guild_id, tiktok_username, started_at) VALUES (?, ?, ?)",
-                (guild.id, username, now_tz(cfg.get("timezone", DEFAULT_TZ)).isoformat())
+                (guild.id, username, now_tz(cfg.get('timezone', DEFAULT_TZ)).isoformat())
             )
             await db.commit()
             return cur.lastrowid
 
-    @client.on("connect")
+    @client.on(ConnectEvent)
     async def on_connect(_: ConnectEvent):
         sid = await open_session()
         current_session_id[guild.id] = sid
@@ -310,23 +307,23 @@ async def start_tiktok(guild: discord.Guild):
         if ch:
             await ch.send(f"🟢 Tracking started for TikTok **@{username}**.")
 
-    @client.on("gift")
+    @client.on(GiftEvent)
     async def on_gift(event: GiftEvent):
         user = event.user.uniqueId
         live_gifters[guild.id][user] = live_gifters[guild.id].get(user, 0) + int(getattr(event.gift, "repeatCount", 1) or 1)
 
-    @client.on("comment")
+    @client.on(CommentEvent)
     async def on_comment(event: CommentEvent):
         user = event.user.uniqueId
         live_commenters[guild.id][user] = live_commenters[guild.id].get(user, 0) + 1
 
-    @client.on("like")
+    @client.on(LikeEvent)
     async def on_like(event: LikeEvent):
         user = event.user.uniqueId
         cnt = int(getattr(event, "likeCount", 1) or 1)
         live_likers[guild.id][user] = live_likers[guild.id].get(user, 0) + cnt
 
-    @client.on("live_end")
+    @client.on(LiveEndEvent)
     async def on_live_end(event: LiveEndEvent):
         cfg_local = await get_guild_cfg(guild.id)
         tz = cfg_local.get("timezone", DEFAULT_TZ)
@@ -335,7 +332,10 @@ async def start_tiktok(guild: discord.Guild):
 
         # Persist tallies
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE live_session SET ended_at=? WHERE id=?", (now_tz(tz).isoformat(), sid))
+            await db.execute(
+                "UPDATE live_session SET ended_at=? WHERE id=?",
+                (now_tz(tz).isoformat(), sid)
+            )
             for user, cnt in live_gifters[guild.id].items():
                 await db.execute("INSERT INTO live_gift VALUES (?, ?, ?, ?)", (sid, guild.id, user, cnt))
             for user, cnt in live_commenters[guild.id].items():
@@ -397,6 +397,7 @@ async def start_tiktok(guild: discord.Guild):
         live_commenters[guild.id].clear()
         live_likers[guild.id].clear()
 
+    # actually start the client
     asyncio.create_task(client.start())
 
 async def stop_tiktok(guild: discord.Guild):
