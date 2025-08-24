@@ -11,24 +11,12 @@ Features:
 - Rotates managed roles:
     • "Top Gifter" after each live (single holder)
     • "Sore Finger" weekly (top liker; single holder) + posts "@user now has sore fingers!"
-- Auto-creates managed roles on join/availability.
-- DM on member join prompting /tokconnect.
-- Optional backscan to auto-link handles from channel history.
+- Auto-creates roles on join/availability; DM on member join to prompt /tokconnect.
+- Backscan command to auto-link handles from chat history.
 - Keep-alive web server for UptimeRobot pings.
-- No Discord webhooks needed (uses bot token).
-
-Env (.env):
-    DISCORD_BOT_TOKEN=xxx
-    DEFAULT_TIMEZONE=Etc/UTC
-    BACKGROUND_IMAGE=assets/creators_connections_bg.png
-    PORT=8080
-
-Install:
-    pip install -r requirements.txt
-
-Run:
-    python bot.py
+- Slash command /cc_test_image to preview the board with dummy data.
 """
+
 from __future__ import annotations
 
 import os
@@ -54,7 +42,7 @@ from aiohttp import web
 # ------------------- Config -------------------
 load_dotenv()
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-DEFAULT_TZ = os.getenv("DEFAULT_TIMEZONE", "Etc/UTC")  # pure GMT/UTC (no DST shifts)
+DEFAULT_TZ = os.getenv("DEFAULT_TIMEZONE", "Etc/UTC")
 DB_PATH = os.getenv("DB_PATH", "supporters.db")
 ASSETS_DIR = os.getenv("ASSETS_DIR", "assets")
 BACKGROUND_IMAGE = os.getenv("BACKGROUND_IMAGE", os.path.join(ASSETS_DIR, "creators_connections_bg.png"))
@@ -64,6 +52,9 @@ CONNECT_PROMPT_TEXT = os.getenv(
     "🔗 Connect your TikTok to your Discord so you can appear on the board and earn roles!\n"
     "Use: `/tokconnect your_tiktok_name` (no @)"
 )
+
+# Optional debug to echo events
+DEBUG_TIKTOK = os.getenv("DEBUG_TIKTOK", "false").lower() == "true"
 
 # ------------------- Utility -------------------
 def now_tz(tz_name: str = DEFAULT_TZ) -> datetime:
@@ -186,57 +177,75 @@ live_likers: Dict[int, Dict[str, int]] = {}
 
 # ------------------- Image Generation -------------------
 def load_font(size: int) -> ImageFont.FreeTypeFont:
-    # Use default bitmap font; swap with TTF if you add one to assets/
+    """
+    Prefer a proper TTF (crisper + scalable). Drop any TTF into assets/
+    e.g. assets/Montserrat-Bold.ttf. Fallback to Pillow default if missing.
+    """
+    ttf_candidates = [
+        os.path.join(ASSETS_DIR, "Montserrat-Bold.ttf"),
+        os.path.join(ASSETS_DIR, "Inter-Bold.ttf"),
+        os.path.join(ASSETS_DIR, "Arial.ttf"),
+    ]
+    for path in ttf_candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size=size)
+            except Exception:
+                pass
     return ImageFont.load_default()
 
-def _fit_text(draw: ImageDraw.ImageDraw, text: str, max_width: int, font_fn, min_size=18, max_size=44):
-    size = max_size
-    while size >= min_size:
-        f = font_fn(size)
-        left, top, right, bottom = draw.textbbox((0,0), text, font=f)
-        w = right - left
-        if w <= max_width:
-            return f
-        size -= 2
-    return font_fn(min_size)
-
-def draw_creators_connections_template(left_rows: List[Tuple[str,int]], right_rows: List[Tuple[str,int]]) -> bytes:
-    """Render the background image and stamp names into the 10 slots per column.
-       left_rows:  [(display_name, score), ...]  # Top Gifters
-       right_rows: [(display_name, score), ...]  # Top Tappers (likes)
+def draw_creators_connections_template(
+    left_rows: List[Tuple[str, int]],
+    right_rows: List[Tuple[str, int]]
+) -> bytes:
+    """
+    Render the background image and stamp WHITE, CENTERED text into the
+    10 rows of each column. left_rows = Top Gifters, right_rows = Top Tappers.
     """
     if not os.path.exists(BACKGROUND_IMAGE):
         raise FileNotFoundError(f"BACKGROUND_IMAGE not found: {BACKGROUND_IMAGE}")
+
     bg = Image.open(BACKGROUND_IMAGE).convert("RGBA")
     W, H = bg.size
-    card = Image.new("RGBA", (W, H))
-    card.alpha_composite(bg)
-    d = ImageDraw.Draw(card)
+    canvas = Image.new("RGBA", (W, H))
+    canvas.alpha_composite(bg)
+    d = ImageDraw.Draw(canvas)
 
-    # Geometry tuned for a 768x1152 portrait board. Adjust as needed for your asset.
-    table_top = int(H * 0.30)
-    row_height = int(H * 0.065)
-    left_x = int(W * 0.18)
-    right_x = int(W * 0.57)
-    cell_width = int(W * 0.30)
-    white = (255, 255, 255, 255)
+    # Geometry tuned for your PNG (768x1152 look). Adjust if you swap art.
+    table_top = int(H * 0.30)        # top of first row
+    row_height = int(H * 0.065)      # about 10 rows high
+    left_x = int(W * 0.18)           # inner-left cell start
+    right_x = int(W * 0.57)          # inner-right cell start
+    cell_width = int(W * 0.30)       # usable width for text
+    text_color = (255, 255, 255, 255)
 
-    def name_only(n_score: Tuple[str,int]) -> str:
-        return str(n_score[0])
+    def draw_centered_name(name: str, row_index: int, col_x: int):
+        # pick a font size that fits within cell_width
+        max_size, min_size = 44, 20
+        size = max_size
+        while size >= min_size:
+            f = load_font(size)
+            l, t, r, b = d.textbbox((0, 0), name, font=f)
+            if (r - l) <= cell_width:
+                break
+            size -= 2
+        f = load_font(max(min(size, max_size), min_size))
+        l, t, r, b = d.textbbox((0, 0), name, font=f)
+        w, h = (r - l), (b - t)
+        row_top = table_top + row_index * row_height
+        x = col_x + (cell_width - w) // 2
+        y = row_top + (row_height - h) // 2
+        d.text((x, y), name, font=f, fill=text_color)
 
+    # draw up to 10 rows each side
     for i in range(10):
-        y = table_top + i * row_height + int(row_height * 0.26)
         if i < len(left_rows):
-            name = name_only(left_rows[i])
-            font = _fit_text(d, name, cell_width, load_font, min_size=20, max_size=44)
-            d.text((left_x, y), name, font=font, fill=white)
+            draw_centered_name(str(left_rows[i][0]), i, left_x)
         if i < len(right_rows):
-            name = name_only(right_rows[i])
-            font = _fit_text(d, name, cell_width, load_font, min_size=20, max_size=44)
-            d.text((right_x, y), name, font=font, fill=white)
+            draw_centered_name(str(right_rows[i][0]), i, right_x)
 
     out = io.BytesIO()
-    card.convert("RGB").save(out, format="PNG")
+    canvas.convert("RGB").save(out, format="PNG")
     return out.getvalue()
 
 # ------------------- Role Helpers -------------------
@@ -266,18 +275,15 @@ async def rotate_single_holder_role(guild: discord.Guild, role: discord.Role, wi
 async def start_tiktok(guild: discord.Guild):
     cfg = await get_guild_cfg(guild.id)
 
-    # Ensure TikTok username exists and is cleaned
     username = cfg.get("tiktok_username")
     if not username:
         raise RuntimeError("❌ No TikTok username set. Use `/toktrack <username>` first.")
     username = str(username).strip().lstrip("@")
 
-    # Ensure target channel exists
     channel_id = cfg.get("channel_id")
     if not channel_id:
         raise RuntimeError("❌ No target channel set. Use `/set_target_channel #channel` first.")
 
-    # Stop old client if one exists
     await stop_tiktok(guild)
 
     try:
@@ -311,17 +317,29 @@ async def start_tiktok(guild: discord.Guild):
     async def on_gift(event: GiftEvent):
         user = event.user.uniqueId
         live_gifters[guild.id][user] = live_gifters[guild.id].get(user, 0) + int(getattr(event.gift, "repeatCount", 1) or 1)
+        if DEBUG_TIKTOK:
+            ch = guild.get_channel(channel_id)
+            if ch:
+                await ch.send(f"[debug] gift from @{user}")
 
     @client.on(CommentEvent)
     async def on_comment(event: CommentEvent):
         user = event.user.uniqueId
         live_commenters[guild.id][user] = live_commenters[guild.id].get(user, 0) + 1
+        if DEBUG_TIKTOK:
+            ch = guild.get_channel(channel_id)
+            if ch:
+                await ch.send(f"[debug] comment by @{user}")
 
     @client.on(LikeEvent)
     async def on_like(event: LikeEvent):
         user = event.user.uniqueId
         cnt = int(getattr(event, "likeCount", 1) or 1)
         live_likers[guild.id][user] = live_likers[guild.id].get(user, 0) + cnt
+        if DEBUG_TIKTOK:
+            ch = guild.get_channel(channel_id)
+            if ch:
+                await ch.send(f"[debug] +{cnt} likes by @{user}")
 
     @client.on(LiveEndEvent)
     async def on_live_end(event: LiveEndEvent):
@@ -330,7 +348,7 @@ async def start_tiktok(guild: discord.Guild):
         channel = guild.get_channel(cfg_local.get("channel_id"))
         sid = current_session_id.get(guild.id)
 
-        # Persist tallies
+        # persist tallies
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "UPDATE live_session SET ended_at=? WHERE id=?",
@@ -347,7 +365,6 @@ async def start_tiktok(guild: discord.Guild):
         gifts_sorted = sorted(live_gifters[guild.id].items(), key=lambda x: x[1], reverse=True)
         tappers_sorted = sorted(live_likers[guild.id].items(), key=lambda x: x[1], reverse=True)
 
-        # Resolve names -> Discord display names if linked
         async def resolve_names(pairs):
             out = []
             async with aiosqlite.connect(DB_PATH) as db:
@@ -368,7 +385,6 @@ async def start_tiktok(guild: discord.Guild):
         gifts_display = await resolve_names(gifts_sorted)
         taps_display = await resolve_names(tappers_sorted)
 
-        # Render & send Creators Connections image
         if channel:
             cc_img = draw_creators_connections_template(gifts_display, taps_display)
             await channel.send(
@@ -376,7 +392,7 @@ async def start_tiktok(guild: discord.Guild):
                 file=discord.File(io.BytesIO(cc_img), filename="creators_connections.png")
             )
 
-        # Rotate Top Gifter role for this LIVE
+        # Rotate Top Gifter role
         if gifts_sorted:
             top_tiktok = gifts_sorted[0][0]
             async with aiosqlite.connect(DB_PATH) as db:
@@ -392,12 +408,11 @@ async def start_tiktok(guild: discord.Guild):
                     if top_role:
                         await rotate_single_holder_role(guild, top_role, member, "Top gifter of last live")
 
-        # Reset for next live
+        # reset for next live
         live_gifters[guild.id].clear()
         live_commenters[guild.id].clear()
         live_likers[guild.id].clear()
 
-    # actually start the client
     asyncio.create_task(client.start())
 
 async def stop_tiktok(guild: discord.Guild):
@@ -411,7 +426,6 @@ async def stop_tiktok(guild: discord.Guild):
 
 # ------------------- Weekly Summary + Sore Finger -------------------
 async def compute_weekly_lists(guild_id: int, start: datetime, end: datetime):
-    """Return (gifts_sorted, likes_sorted) limited to sessions in the week window."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT id FROM live_session WHERE guild_id=? AND started_at>=? AND (ended_at<=? OR ended_at IS NULL)",
@@ -476,10 +490,8 @@ async def post_weekly_summary(guild_id: int):
         "📅 **Creators Connections — Weekly Summary**\nLeft: Top Gifters • Right: Top Tappers",
         file=discord.File(io.BytesIO(img), filename="creators_connections_weekly.png")
     )
-    # Friendly reminder to connect
     await ch.send("🔗 Reminder: Link your TikTok with `/tokconnect your_tiktok_name` so we can match your Discord and rank you on the board!")
 
-    # Sore Finger: top liker of the week
     if likes:
         top_tiktok = likes[0][0]
         role = await ensure_named_role(guild, "Sore Finger")
@@ -573,7 +585,7 @@ async def backscan(interaction: discord.Interaction, limit: app_commands.Range[i
     if not scan_ch:
         await interaction.followup.send("❌ No channel to scan. Set one via /set_target_channel or pass a channel.", ephemeral=True)
         return
-    pattern = re.compile(r"(?:tiktok\\.com/\\@|\\B\\@)([A-Za-z0-9._-]{2,24})")
+    pattern = re.compile(r"(?:tiktok\.com/\@|\B\@)([A-Za-z0-9._-]{2,24})")
     found: Dict[int, set[str]] = {}
     async for msg in scan_ch.history(limit=limit):
         for m in pattern.finditer(msg.content or ""):
@@ -594,6 +606,19 @@ async def backscan(interaction: discord.Interaction, limit: app_commands.Range[i
         member = interaction.guild.get_member(uid) or await interaction.guild.fetch_member(uid)
         lines.append(f"• {member.display_name}: " + ", ".join(f"@{h}" for h in sorted(handles)))
     await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+# --- NEW: test image command (dummy data) ---
+@tree.command(name="cc_test_image", description="(Admin) Post a test leaderboard with dummy data")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def cc_test_image(interaction: discord.Interaction):
+    left = [(f"userGifter{i}", 110 - i * 10) for i in range(1, 11)]
+    right = [(f"userTapper{i}", 5000 - i * 250) for i in range(1, 11)]
+    img_bytes = draw_creators_connections_template(left, right)
+    await interaction.response.send_message(
+        "🧪 **Creators Connections — Test Image**\nLeft: Top Gifters • Right: Top Tappers",
+        file=discord.File(io.BytesIO(img_bytes), filename="creators_connections_TEST.png"),
+        ephemeral=False
+    )
 
 # ------------------- Keep-Alive Web Server -------------------
 async def _ok(_: web.Request) -> web.Response:
