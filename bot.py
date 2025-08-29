@@ -15,12 +15,6 @@ Creators Connections — TikTok → Discord Graphic Leaderboard Bot (no webhooks
 - Keep-alive web server for UptimeRobot pings.
 - No Discord webhooks needed (uses bot token).
 
-Env (.env):
-    DISCORD_BOT_TOKEN=xxx
-    DEFAULT_TIMEZONE=Etc/UTC
-    BACKGROUND_IMAGE=assets/creators_connections_bg.png
-    PORT=8080
-
 Run:
     python bot.py
 """
@@ -200,7 +194,7 @@ def load_font(size: int) -> ImageFont.FreeTypeFont:
                 pass
     return ImageFont.load_default()
 
-def _fit_text(draw: ImageDraw.ImageDraw, text: str, max_width: int, font_fn, min_size=22, max_size=48):
+def _fit_text(draw: ImageDraw.ImageDraw, text: str, max_width: int, font_fn, min_size=22, max_size=52):
     """Return the largest font that fits in max_width (binary search)."""
     lo, hi = min_size, max_size
     best = font_fn(min_size)
@@ -236,25 +230,28 @@ def draw_creators_connections_template(
     WHITE = (255, 255, 255, 255)
 
     # Geometry tuned for your neon board (768x1152). Nudge if needed.
+    ROWS = 10
     TABLE_TOP    = int(0.355 * H)   # top of first row
     TABLE_BOTTOM = int(0.905 * H)   # bottom of last row
-    ROWS = 10
     table_height = TABLE_BOTTOM - TABLE_TOP
     row_height = table_height // ROWS
 
-    LEFT_X   = int(0.205 * W)       # left column text cell start
-    RIGHT_X  = int(0.585 * W)       # right column text cell start
-    CELL_W   = int(0.315 * W)       # cell text width
+    LEFT_X   = int(0.205 * W)       # inner-left cell x
+    RIGHT_X  = int(0.585 * W)       # inner-right cell x
+    CELL_W   = int(0.315 * W)       # cell width
 
     def centered_draw(name: str, row_index: int, col_x: int):
-        # Choose largest font that fits width, then center vertically and horizontally
-        font = _fit_text(d, name, CELL_W, load_font, min_size=22, max_size=48)
+        # largest possible font that fits width
+        font = _fit_text(d, name, CELL_W, load_font, min_size=22, max_size=52)
         l, t, r, b = d.textbbox((0, 0), name, font=font)
         text_w, text_h = (r - l), (b - t)
+
         row_top = TABLE_TOP + row_index * row_height
         row_center_y = row_top + row_height // 2
+
         x = col_x + (CELL_W - text_w) // 2
-        y = row_center_y - text_h // 2
+        y = row_center_y - text_h // 2  # true vertical center
+
         d.text((x, y), name, font=font, fill=WHITE)
 
     for i in range(ROWS):
@@ -563,10 +560,14 @@ async def set_target_channel(interaction: discord.Interaction, channel: discord.
 @tree.command(name="start_tiktok", description="Start TikTok tracking for this server")
 async def start_cmd(interaction: discord.Interaction):
     try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
         await start_tiktok(interaction.guild)
-        await interaction.response.send_message("🟢 Started TikTok tracking.", ephemeral=True)
+        await interaction.followup.send("🟢 Started TikTok tracking.", ephemeral=True)
     except Exception as e:
-        await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
+        if interaction.response.is_done():
+            await interaction.followup.send(f"⚠️ {e}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
 
 @tree.command(name="stop_tiktok", description="Stop TikTok tracking")
 async def stop_cmd(interaction: discord.Interaction):
@@ -582,18 +583,19 @@ async def post_connect_prompt_cmd(interaction: discord.Interaction):
     if not channel:
         await interaction.response.send_message("❌ Set a target channel first with /set_target_channel", ephemeral=True)
         return
+    await interaction.response.defer(ephemeral=True, thinking=True)
     msg = await channel.send(CONNECT_PROMPT_TEXT)
     try:
         await msg.pin()
     except Exception:
         pass
-    await interaction.response.send_message("✅ Posted and pinned connect prompt.", ephemeral=True)
+    await interaction.followup.send("✅ Posted and pinned connect prompt.", ephemeral=True)
 
 @tree.command(name="backscan", description="Admin: scan recent messages for TikTok handles/links and auto-link authors")
 @app_commands.describe(limit="Messages to scan (10–2000)", channel="Channel to scan (defaults to target channel)")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def backscan(interaction: discord.Interaction, limit: app_commands.Range[int, 10, 2000]=200, channel: Optional[discord.TextChannel]=None):
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
     cfg = await get_guild_cfg(interaction.guild_id)
     scan_ch = channel or interaction.guild.get_channel(cfg.get("channel_id"))
     if not scan_ch:
@@ -621,17 +623,19 @@ async def backscan(interaction: discord.Interaction, limit: app_commands.Range[i
         lines.append(f"• {member.display_name}: " + ", ".join(f"@{h}" for h in sorted(handles)))
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 
-# Test image command (dummy data)
+# Test image command (dummy data) — DEFERS to avoid timeout
 @tree.command(name="cc_test_image", description="(Admin) Post a test leaderboard with dummy data")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def cc_test_image(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False, thinking=True)
+
     left = [(f"userGifter{i}", 110 - i * 10) for i in range(1, 11)]
     right = [(f"userTapper{i}", 5000 - i * 250) for i in range(1, 11)]
     img_bytes = draw_creators_connections_template(left, right)
-    await interaction.response.send_message(
+
+    await interaction.followup.send(
         "🧪 **Creators Connections — Test Image**\nLeft: Top Gifters • Right: Top Tappers",
         file=discord.File(io.BytesIO(img_bytes), filename="creators_connections_TEST.png"),
-        ephemeral=False
     )
 
 # ------------------- Keep-Alive Web Server -------------------
