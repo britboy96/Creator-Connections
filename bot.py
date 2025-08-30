@@ -306,13 +306,27 @@ async def start_tiktok(guild: discord.Guild):
     await stop_tiktok(guild)
 
     try:
-        # UPDATED: use authenticated session cookie when provided (for 18+ lives)
+        # Create client normally, then attach session cookie if provided.
+        client = TikTokLiveClient(unique_id=username)
+
         sess = (os.getenv("TIKTOK_SESSIONID") or "").strip()
         if sess:
-            # Auth via cookie for age-gated/restricted lives
-            client = TikTokLiveClient(unique_id=username, cookies={"sessionid": sess})
-        else:
-            client = TikTokLiveClient(unique_id=username)
+            # Try common internals used across TikTokLive versions
+            try:
+                http = getattr(client, "http", None) or getattr(client, "_client", None)
+                if http and hasattr(http, "cookies"):
+                    # Most httpx/aiohttp-style clients mounted here
+                    http.cookies.set("sessionid", sess, domain=".tiktok.com")
+                elif http and hasattr(http, "cookie_jar"):
+                    # aiohttp cookie jar style
+                    http.cookie_jar.update_cookies({"sessionid": sess}, response_url="https://www.tiktok.com/")
+                # Fallback: header injection
+                if hasattr(client, "headers") and isinstance(client.headers, dict):
+                    client.headers["cookie"] = f"sessionid={sess}"
+            except Exception:
+                # Last-resort header injection
+                if hasattr(client, "headers") and isinstance(client.headers, dict):
+                    client.headers["cookie"] = f"sessionid={sess}"
     except Exception as e:
         raise RuntimeError(f"Failed to create TikTok client for @{username}: {e}")
 
