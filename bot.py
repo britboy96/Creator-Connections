@@ -54,8 +54,10 @@ CONNECT_PROMPT_TEXT = os.getenv(
     "🔗 Connect your TikTok to your Discord so you can appear on the board and earn roles!\n"
     "Use: `/tokconnect your_tiktok_name` (no @)"
 )
-# Force debug ON as requested
-DEBUG_TIKTOK = True
+DEBUG_TIKTOK = os.getenv("DEBUG_TIKTOK", "false").lower() == "true"
+
+# NEW: TikTok session cookie for age-restricted/18+ lives
+TIKTOK_SESSIONID = os.getenv("TIKTOK_SESSIONID")
 
 # ------------------- Utility -------------------
 def now_tz(tz_name: str = DEFAULT_TZ) -> datetime:
@@ -304,7 +306,8 @@ async def start_tiktok(guild: discord.Guild):
     await stop_tiktok(guild)
 
     try:
-        client = TikTokLiveClient(unique_id=username)
+        # UPDATED: pass sessionid so client can access 18+ / restricted lives
+        client = TikTokLiveClient(unique_id=username, sessionid=TIKTOK_SESSIONID)
     except Exception as e:
         raise RuntimeError(f"Failed to create TikTok client for @{username}: {e}")
 
@@ -637,20 +640,6 @@ async def cc_test_image(interaction: discord.Interaction):
     await interaction.followup.send(
         "🧪 **Creators Connections — Test Image**\nLeft: Top Gifters • Right: Top Tappers",
         file=discord.File(io.BytesIO(img_bytes), filename="creators_connections_TEST.png"),
-    )
-
-# NEW: status command
-@tree.command(name="cc_status", description="Show TikTok tracking status & current tallies")
-async def cc_status(interaction: discord.Interaction):
-    client = running_clients.get(interaction.guild_id)
-    ggifters = live_gifters.get(interaction.guild_id, {})
-    glikers = live_likers.get(interaction.guild_id, {})
-    state = "running" if client else "stopped"
-    top_gifters = ", ".join([f"@{u}:{c}" for u, c in sorted(ggifters.items(), key=lambda x: x[1], reverse=True)[:5]]) or "none"
-    top_likers = ", ".join([f"@{u}:{c}" for u, c in sorted(glikers.items(), key=lambda x: x[1], reverse=True)[:5]]) or "none"
-    await interaction.response.send_message(
-        f"Status: **{state}**\nTop gifters (live): {top_gifters}\nTop likers (live): {top_likers}",
-        ephemeral=True
     )
 
 # ------------------- Keep-Alive Web Server -------------------
