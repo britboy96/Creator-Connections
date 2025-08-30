@@ -307,9 +307,10 @@ async def start_tiktok(guild: discord.Guild):
 
     try:
         # UPDATED: use authenticated session cookie when provided (for 18+ lives)
-        sess = os.getenv("TIKTOK_SESSIONID", "").strip()
+        sess = (os.getenv("TIKTOK_SESSIONID") or "").strip()
         if sess:
-            client = TikTokLiveClient(unique_id=username, session_id=sess)
+            # Auth via cookie for age-gated/restricted lives
+            client = TikTokLiveClient(unique_id=username, cookies={"sessionid": sess})
         else:
             client = TikTokLiveClient(unique_id=username)
     except Exception as e:
