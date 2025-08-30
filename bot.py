@@ -306,8 +306,12 @@ async def start_tiktok(guild: discord.Guild):
     await stop_tiktok(guild)
 
     try:
-        # UPDATED: pass sessionid so client can access 18+ / restricted lives
-        client = TikTokLiveClient(unique_id=username, sessionid=TIKTOK_SESSIONID)
+        # UPDATED: use authenticated session cookie when provided (for 18+ lives)
+        sess = os.getenv("TIKTOK_SESSIONID", "").strip()
+        if sess:
+            client = TikTokLiveClient(unique_id=username, session_id=sess)
+        else:
+            client = TikTokLiveClient(unique_id=username)
     except Exception as e:
         raise RuntimeError(f"Failed to create TikTok client for @{username}: {e}")
 
