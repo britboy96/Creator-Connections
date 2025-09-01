@@ -55,9 +55,7 @@ CONNECT_PROMPT_TEXT = os.getenv(
     "Use: `/tokconnect your_tiktok_name` (no @)"
 )
 DEBUG_TIKTOK = os.getenv("DEBUG_TIKTOK", "false").lower() == "true"
-
-# NEW: TikTok session cookie for age-restricted/18+ lives
-TIKTOK_SESSIONID = os.getenv("TIKTOK_SESSIONID")
+TIKTOK_SESSIONID = os.getenv("TIKTOK_SESSIONID", "").strip()  # optional (for 18+ lives)
 
 # ------------------- Utility -------------------
 def now_tz(tz_name: str = DEFAULT_TZ) -> datetime:
@@ -178,11 +176,10 @@ live_gifters: Dict[int, Dict[str, int]] = {}
 live_commenters: Dict[int, Dict[str, int]] = {}
 live_likers: Dict[int, Dict[str, int]] = {}
 
-# ------------------- Image Generation (UPDATED) -------------------
+# ------------------- Image Generation -------------------
 def load_font(size: int) -> ImageFont.FreeTypeFont:
     """
-    Prefer a proper TTF (crisper + scalable). Drop any TTF into assets/
-    e.g. assets/Montserrat-Bold.ttf. Falls back to Pillow bitmap if missing.
+    Prefer a proper TTF (crisper + scalable). Put fonts into assets/ (e.g., Montserrat-Bold.ttf).
     """
     ttf_candidates = [
         os.path.join(ASSETS_DIR, "Montserrat-Bold.ttf"),
@@ -232,19 +229,18 @@ def draw_creators_connections_template(
     d = ImageDraw.Draw(canvas)
     WHITE = (255, 255, 255, 255)
 
-    # Geometry tuned for your neon board (768x1152). Nudge if needed.
+    # Geometry tuned for your neon board (768x1152). Adjust if needed.
     ROWS = 10
     TABLE_TOP    = int(0.355 * H)   # top of first row
     TABLE_BOTTOM = int(0.905 * H)   # bottom of last row
     table_height = TABLE_BOTTOM - TABLE_TOP
     row_height = table_height // ROWS
 
-    LEFT_X   = int(0.205 * W)       # inner-left cell x
-    RIGHT_X  = int(0.585 * W)       # inner-right cell x
+    LEFT_X   = int(0.205 * W)       # left text cell x
+    RIGHT_X  = int(0.585 * W)       # right text cell x
     CELL_W   = int(0.315 * W)       # cell width
 
     def centered_draw(name: str, row_index: int, col_x: int):
-        # largest possible font that fits width
         font = _fit_text(d, name, CELL_W, load_font, min_size=22, max_size=52)
         l, t, r, b = d.textbbox((0, 0), name, font=font)
         text_w, text_h = (r - l), (b - t)
@@ -253,8 +249,7 @@ def draw_creators_connections_template(
         row_center_y = row_top + row_height // 2
 
         x = col_x + (CELL_W - text_w) // 2
-        y = row_center_y - text_h // 2  # true vertical center
-
+        y = row_center_y - text_h // 2
         d.text((x, y), name, font=font, fill=WHITE)
 
     for i in range(ROWS):
@@ -291,6 +286,24 @@ async def rotate_single_holder_role(guild: discord.Guild, role: discord.Role, wi
             pass
 
 # ------------------- TikTok Handling -------------------
+def _user_id_from_event_user(u) -> str:
+    """
+    TikTokLive changed field names across versions:
+    - old: u.uniqueId
+    - new: u.unique_id
+    Fallbacks: u.nickname or str(u.id) if present.
+    """
+    for attr in ("uniqueId", "unique_id", "username"):
+        if hasattr(u, attr):
+            val = getattr(u, attr)
+            if isinstance(val, str) and val:
+                return val
+    if hasattr(u, "nickname") and isinstance(u.nickname, str) and u.nickname:
+        return u.nickname
+    if hasattr(u, "id"):
+        return str(getattr(u, "id"))
+    return "unknown_user"
+
 async def start_tiktok(guild: discord.Guild):
     cfg = await get_guild_cfg(guild.id)
 
@@ -306,25 +319,38 @@ async def start_tiktok(guild: discord.Guild):
     await stop_tiktok(guild)
 
     try:
-        # Create client normally, then attach session cookie if provided.
+        # Create client in a supported way, then *inject* the session cookie if provided.
         client = TikTokLiveClient(unique_id=username)
 
-        sess = (os.getenv("TIKTOK_SESSIONID") or "").strip()
+        sess = TIKTOK_SESSIONID
         if sess:
-            # Try common internals used across TikTokLive versions
             try:
+                # Try common internal clients to set cookie
                 http = getattr(client, "http", None) or getattr(client, "_client", None)
+                # httpx-style
                 if http and hasattr(http, "cookies"):
-                    # Most httpx/aiohttp-style clients mounted here
-                    http.cookies.set("sessionid", sess, domain=".tiktok.com")
+                    try:
+                        http.cookies.set("sessionid", sess, domain=".tiktok.com")
+                    except Exception:
+                        http.cookies.set("sessionid", sess)
+                # aiohttp-style
                 elif http and hasattr(http, "cookie_jar"):
-                    # aiohttp cookie jar style
-                    http.cookie_jar.update_cookies({"sessionid": sess}, response_url="https://www.tiktok.com/")
-                # Fallback: header injection
+                    try:
+                        http.cookie_jar.update_cookies({"sessionid": sess}, response_url="https://www.tiktok.com/")
+                    except Exception:
+                        http.cookie_jar.update_cookies({"sessionid": sess})
+                # Header fallback
                 if hasattr(client, "headers") and isinstance(client.headers, dict):
-                    client.headers["cookie"] = f"sessionid={sess}"
+                    # ensure we don't clobber other cookies
+                    base = client.headers.get("cookie", "").strip()
+                    add = f"sessionid={sess}"
+                    if base:
+                        if "sessionid=" not in base:
+                            client.headers["cookie"] = base + "; " + add
+                    else:
+                        client.headers["cookie"] = add
             except Exception:
-                # Last-resort header injection
+                # last-resort header injection
                 if hasattr(client, "headers") and isinstance(client.headers, dict):
                     client.headers["cookie"] = f"sessionid={sess}"
     except Exception as e:
@@ -354,31 +380,47 @@ async def start_tiktok(guild: discord.Guild):
 
     @client.on(GiftEvent)
     async def on_gift(event: GiftEvent):
-        user = event.user.uniqueId
-        live_gifters[guild.id][user] = live_gifters[guild.id].get(user, 0) + int(getattr(event.gift, "repeatCount", 1) or 1)
-        if DEBUG_TIKTOK:
+        try:
+            user = _user_id_from_event_user(event.user)
+            amount = int(getattr(event.gift, "repeatCount", 1) or 1)
+            live_gifters[guild.id][user] = live_gifters[guild.id].get(user, 0) + amount
+            if DEBUG_TIKTOK:
+                ch = guild.get_channel(channel_id)
+                if ch:
+                    await ch.send(f"[debug] gift from @{user} (+{amount})")
+        except Exception as e:
             ch = guild.get_channel(channel_id)
-            if ch:
-                await ch.send(f"[debug] gift from @{user}")
+            if ch and DEBUG_TIKTOK:
+                await ch.send(f"[debug] gift handler error: {e}")
 
     @client.on(CommentEvent)
     async def on_comment(event: CommentEvent):
-        user = event.user.uniqueId
-        live_commenters[guild.id][user] = live_commenters[guild.id].get(user, 0) + 1
-        if DEBUG_TIKTOK:
+        try:
+            user = _user_id_from_event_user(event.user)
+            live_commenters[guild.id][user] = live_commenters[guild.id].get(user, 0) + 1
+            if DEBUG_TIKTOK:
+                ch = guild.get_channel(channel_id)
+                if ch:
+                    await ch.send(f"[debug] comment by @{user}")
+        except Exception as e:
             ch = guild.get_channel(channel_id)
-            if ch:
-                await ch.send(f"[debug] comment by @{user}")
+            if ch and DEBUG_TIKTOK:
+                await ch.send(f"[debug] comment handler error: {e}")
 
     @client.on(LikeEvent)
     async def on_like(event: LikeEvent):
-        user = event.user.uniqueId
-        cnt = int(getattr(event, "likeCount", 1) or 1)
-        live_likers[guild.id][user] = live_likers[guild.id].get(user, 0) + cnt
-        if DEBUG_TIKTOK:
+        try:
+            user = _user_id_from_event_user(event.user)
+            cnt = int(getattr(event, "likeCount", 1) or 1)
+            live_likers[guild.id][user] = live_likers[guild.id].get(user, 0) + cnt
+            if DEBUG_TIKTOK:
+                ch = guild.get_channel(channel_id)
+                if ch:
+                    await ch.send(f"[debug] +{cnt} likes by @{user}")
+        except Exception as e:
             ch = guild.get_channel(channel_id)
-            if ch:
-                await ch.send(f"[debug] +{cnt} likes by @{user}")
+            if ch and DEBUG_TIKTOK:
+                await ch.send(f"[debug] like handler error: {e}")
 
     @client.on(LiveEndEvent)
     async def on_live_end(event: LiveEndEvent):
@@ -559,6 +601,7 @@ async def weekly_scheduler():
 # ------------------- Commands -------------------
 @tree.command(name="tokconnect", description="Link your TikTok username to your Discord (viewer-level)")
 async def tokconnect(interaction: discord.Interaction, username: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
     handle = username.strip().lstrip("@")
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -567,18 +610,20 @@ async def tokconnect(interaction: discord.Interaction, username: str):
             (interaction.guild_id, handle, interaction.user.id)
         )
         await db.commit()
-    await interaction.response.send_message(f"🔗 Linked @{handle} → {interaction.user.mention}", ephemeral=True)
+    await interaction.followup.send(f"🔗 Linked @{handle} → {interaction.user.mention}", ephemeral=True)
 
 @tree.command(name="toktrack", description="Admin: set the TikTok host account to track")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def toktrack(interaction: discord.Interaction, username: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
     await upsert_guild_cfg(interaction.guild_id, tiktok_username=username.strip().lstrip('@'))
-    await interaction.response.send_message(f"✅ Host set to @{username.strip().lstrip('@')}", ephemeral=True)
+    await interaction.followup.send(f"✅ Host set to @{username.strip().lstrip('@')}", ephemeral=True)
 
 @tree.command(name="set_target_channel", description="Set the channel for leaderboard posts")
 async def set_target_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    await interaction.response.defer(ephemeral=True, thinking=True)
     await upsert_guild_cfg(interaction.guild_id, channel_id=channel.id)
-    await interaction.response.send_message(f"Target channel set to {channel.mention}", ephemeral=True)
+    await interaction.followup.send(f"Target channel set to {channel.mention}", ephemeral=True)
 
 @tree.command(name="start_tiktok", description="Start TikTok tracking for this server")
 async def start_cmd(interaction: discord.Interaction):
@@ -594,19 +639,20 @@ async def start_cmd(interaction: discord.Interaction):
 
 @tree.command(name="stop_tiktok", description="Stop TikTok tracking")
 async def stop_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
     await stop_tiktok(interaction.guild)
-    await interaction.response.send_message("🛑 Stopped TikTok tracking.", ephemeral=True)
+    await interaction.followup.send("🛑 Stopped TikTok tracking.", ephemeral=True)
 
 @tree.command(name="post_connect_prompt", description="Post & pin the connect prompt (admin)")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def post_connect_prompt_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
     cfg = await get_guild_cfg(interaction.guild_id)
     ch_id = cfg.get("channel_id")
     channel = interaction.guild.get_channel(ch_id) if ch_id else None
     if not channel:
-        await interaction.response.send_message("❌ Set a target channel first with /set_target_channel", ephemeral=True)
+        await interaction.followup.send("❌ Set a target channel first with /set_target_channel", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True, thinking=True)
     msg = await channel.send(CONNECT_PROMPT_TEXT)
     try:
         await msg.pin()
@@ -646,19 +692,32 @@ async def backscan(interaction: discord.Interaction, limit: app_commands.Range[i
         lines.append(f"• {member.display_name}: " + ", ".join(f"@{h}" for h in sorted(handles)))
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 
-# Test image command (dummy data) — DEFERS to avoid timeout
+# Test image command (dummy data)
 @tree.command(name="cc_test_image", description="(Admin) Post a test leaderboard with dummy data")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def cc_test_image(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False, thinking=True)
-
     left = [(f"userGifter{i}", 110 - i * 10) for i in range(1, 11)]
     right = [(f"userTapper{i}", 5000 - i * 250) for i in range(1, 11)]
     img_bytes = draw_creators_connections_template(left, right)
-
     await interaction.followup.send(
         "🧪 **Creators Connections — Test Image**\nLeft: Top Gifters • Right: Top Tappers",
         file=discord.File(io.BytesIO(img_bytes), filename="creators_connections_TEST.png"),
+    )
+
+# NEW: Live status/debug
+@tree.command(name="cc_status", description="Show TikTok tracking status & current tallies")
+async def cc_status(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    client = running_clients.get(interaction.guild_id)
+    ggifters = live_gifters.get(interaction.guild_id, {})
+    glikers = live_likers.get(interaction.guild_id, {})
+    state = "running" if client else "stopped"
+    top_gifters = ", ".join([f"@{u}:{c}" for u, c in sorted(ggifters.items(), key=lambda x: x[1], reverse=True)[:5]]) or "none"
+    top_likers = ", ".join([f"@{u}:{c}" for u, c in sorted(glikers.items(), key=lambda x: x[1], reverse=True)[:5]]) or "none"
+    await interaction.followup.send(
+        f"Status: **{state}**\nTop gifters (live): {top_gifters}\nTop likers (live): {top_likers}",
+        ephemeral=True
     )
 
 # ------------------- Keep-Alive Web Server -------------------
