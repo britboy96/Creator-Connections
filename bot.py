@@ -1,19 +1,15 @@
 """
 Creators Connections — TikTok → Discord Graphic Leaderboard Bot (no webhooks)
 
-- Tracks TikTok LIVE gifts & likes using TikTokLive (no TikTok webhooks)
-- Generates one image per live:
-    Left = Top Gifters (top 10)
-    Right = Top Tappers (Likes) (top 10)
-  Names are Discord display names if linked via /tokconnect; else @TikTok name.
-- Weekly summary auto-post (Saturday 19:00 UTC) using same image.
-- Roles:
-    • "Top Gifter" after each live (single holder)
-    • "Sore Finger" weekly (top liker; single holder) + posts "@user now has sore fingers!"
-- Auto-creates roles on join/availability; DM on member join to prompt /tokconnect.
-- Backscan command to auto-link handles from chat history.
-- Keep-alive web server for UptimeRobot pings.
-- No Discord webhooks needed (uses bot token).
+UPDATES INCLUDED
+1) Health ping auto-checks if host is live; if live and not already tracking, auto-starts (no spam).
+2) XP system on gifts (diamonds if present else 100 XP). Rank-ups announced (Bronze → Unreal).
+3) Image text auto-resize + ellipsis and true vertical centering.
+4) Custom live-recap caption via POST_LIVE_MESSAGE.
+5) Weekly summary fixed:
+   - Overlap-window query so sessions starting before the week but ending inside it count.
+   - Includes current in-memory tallies for any ongoing or unflushed live, so it never posts empty.
+6) Monthly XP tally: 1st of each month @ 12:00 — lists EVERYONE grouped by current rank (deduped).
 
 Run:
     python bot.py
@@ -24,6 +20,7 @@ from __future__ import annotations
 import os
 import io
 import re
+import time
 import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
@@ -39,7 +36,7 @@ from discord import app_commands
 
 from TikTokLive import TikTokLiveClient
 from TikTokLive.events import GiftEvent, LiveEndEvent, CommentEvent, ConnectEvent, LikeEvent
-from aiohttp import web
+from aiohttp import web, ClientSession, ClientTimeout
 
 # ------------------- Config -------------------
 load_dotenv()
@@ -54,8 +51,25 @@ CONNECT_PROMPT_TEXT = os.getenv(
     "🔗 Connect your TikTok to your Discord so you can appear on the board and earn roles!\n"
     "Use: `/tokconnect your_tiktok_name` (no @)"
 )
+POST_LIVE_MESSAGE = os.getenv(
+    "POST_LIVE_MESSAGE",
+    "🎬 **Creators Connections — Live Recap**\nLeft: Top Gifters • Right: Top Tappers"
+)
 DEBUG_TIKTOK = os.getenv("DEBUG_TIKTOK", "false").lower() == "true"
-TIKTOK_SESSIONID = os.getenv("TIKTOK_SESSIONID", "").strip()  # optional (for 18+ lives)
+TIKTOK_SESSIONID = os.getenv("TIKTOK_SESSIONID", "").strip()
+
+# XP / Ranks
+DEFAULT_XP_PER_GIFT = int(os.getenv("DEFAULT_XP_PER_GIFT", "100"))
+RANKS = [
+    ("Bronze", 0),
+    ("Silver", 1500),
+    ("Gold", 3500),
+    ("Platinum", 6500),
+    ("Diamond", 10500),
+    ("Elite", 15500),
+    ("Champion", 21500),
+    ("Unreal", 28500),
+]
 
 # ------------------- Utility -------------------
 def now_tz(tz_name: str = DEFAULT_TZ) -> datetime:
@@ -116,6 +130,22 @@ async def ensure_db():
                 count INTEGER
             );
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_xp (
+                guild_id INTEGER,
+                discord_user_id INTEGER,
+                xp INTEGER DEFAULT 0,
+                PRIMARY KEY (guild_id, discord_user_id)
+            );
+        """)
+        # track monthly XP post dedupe
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS monthly_posted (
+                guild_id INTEGER,
+                yyyymm TEXT,
+                PRIMARY KEY (guild_id, yyyymm)
+            );
+        """)
         await db.commit()
 
 async def get_guild_cfg(guild_id: int) -> dict:
@@ -164,6 +194,9 @@ async def upsert_guild_cfg(guild_id: int, **kwargs):
         ))
         await db.commit()
 
+def yyyymm(dt: datetime) -> str:
+    return dt.strftime("%Y%m")
+
 # ------------------- Discord Setup -------------------
 intents = discord.Intents.default()
 intents.members = True
@@ -176,11 +209,10 @@ live_gifters: Dict[int, Dict[str, int]] = {}
 live_commenters: Dict[int, Dict[str, int]] = {}
 live_likers: Dict[int, Dict[str, int]] = {}
 
+_last_auto_start: Dict[int, float] = {}  # throttle for auto-starts
+
 # ------------------- Image Generation -------------------
 def load_font(size: int) -> ImageFont.FreeTypeFont:
-    """
-    Prefer a proper TTF (crisper + scalable). Put fonts into assets/ (e.g., Montserrat-Bold.ttf).
-    """
     ttf_candidates = [
         os.path.join(ASSETS_DIR, "Montserrat-Bold.ttf"),
         os.path.join(ASSETS_DIR, "Inter-Bold.ttf"),
@@ -194,8 +226,7 @@ def load_font(size: int) -> ImageFont.FreeTypeFont:
                 pass
     return ImageFont.load_default()
 
-def _fit_text(draw: ImageDraw.ImageDraw, text: str, max_width: int, font_fn, min_size=22, max_size=52):
-    """Return the largest font that fits in max_width (binary search)."""
+def _fit_font(draw: ImageDraw.ImageDraw, text: str, max_width: int, font_fn, min_size=20, max_size=64):
     lo, hi = min_size, max_size
     best = font_fn(min_size)
     while lo <= hi:
@@ -209,15 +240,20 @@ def _fit_text(draw: ImageDraw.ImageDraw, text: str, max_width: int, font_fn, min
             hi = mid - 1
     return best
 
+def _ellipsis_to_fit(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> str:
+    l, t, r, b = draw.textbbox((0, 0), text, font=font)
+    if (r - l) <= max_width:
+        return text
+    prefix = "@"
+    core = text[1:] if text.startswith("@") else text
+    while core and draw.textlength(prefix + core + "…", font=font) > max_width:
+        core = core[:-1]
+    return (prefix + core + "…") if core else "…"
+
 def draw_creators_connections_template(
     left_rows: List[Tuple[str, int]],
     right_rows: List[Tuple[str, int]]
 ) -> bytes:
-    """
-    Render the leaderboard with WHITE, CENTERED names in each grid cell.
-    left_rows  = Top Gifters ([(display_name, score), ...])
-    right_rows = Top Tappers ([(display_name, score), ...])
-    """
     if not os.path.exists(BACKGROUND_IMAGE):
         raise FileNotFoundError(f"BACKGROUND_IMAGE not found: {BACKGROUND_IMAGE}")
 
@@ -229,28 +265,25 @@ def draw_creators_connections_template(
     d = ImageDraw.Draw(canvas)
     WHITE = (255, 255, 255, 255)
 
-    # Geometry tuned for your neon board (768x1152). Adjust if needed.
     ROWS = 10
-    TABLE_TOP    = int(0.355 * H)   # top of first row
-    TABLE_BOTTOM = int(0.905 * H)   # bottom of last row
-    table_height = TABLE_BOTTOM - TABLE_TOP
-    row_height = table_height // ROWS
+    TABLE_TOP    = int(0.355 * H)
+    TABLE_BOTTOM = int(0.905 * H)
+    row_height = (TABLE_BOTTOM - TABLE_TOP) // ROWS
 
-    LEFT_X   = int(0.205 * W)       # left text cell x
-    RIGHT_X  = int(0.585 * W)       # right text cell x
-    CELL_W   = int(0.315 * W)       # cell width
+    LEFT_X   = int(0.205 * W)
+    RIGHT_X  = int(0.585 * W)
+    CELL_W   = int(0.315 * W)
 
     def centered_draw(name: str, row_index: int, col_x: int):
-        font = _fit_text(d, name, CELL_W, load_font, min_size=22, max_size=52)
-        l, t, r, b = d.textbbox((0, 0), name, font=font)
+        font = _fit_font(d, name, CELL_W, load_font, min_size=20, max_size=64)
+        txt = _ellipsis_to_fit(d, name, font, CELL_W)
+        l, t, r, b = d.textbbox((0, 0), txt, font=font)
         text_w, text_h = (r - l), (b - t)
-
         row_top = TABLE_TOP + row_index * row_height
         row_center_y = row_top + row_height // 2
-
         x = col_x + (CELL_W - text_w) // 2
         y = row_center_y - text_h // 2
-        d.text((x, y), name, font=font, fill=WHITE)
+        d.text((x, y), txt, font=font, fill=WHITE)
 
     for i in range(ROWS):
         if i < len(left_rows):
@@ -285,14 +318,66 @@ async def rotate_single_holder_role(guild: discord.Guild, role: discord.Role, wi
         except Exception:
             pass
 
+# ------------------- XP Helpers -------------------
+def _rank_for_xp(xp: int) -> Tuple[str, int]:
+    current_name, current_idx = RANKS[0][0], 0
+    for idx, (name, thresh) in enumerate(RANKS):
+        if xp >= thresh:
+            current_name, current_idx = name, idx
+        else:
+            break
+    return current_name, current_idx
+
+async def _award_xp_for_tiktok_user(guild: discord.Guild, tiktok_user: str, xp_gain: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT discord_user_id FROM link_map WHERE guild_id=? AND tiktok_username=?",
+            (guild.id, tiktok_user)
+        ) as cur:
+            row = await cur.fetchone()
+
+    if not row:
+        return
+
+    discord_user_id = row[0]
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT xp FROM user_xp WHERE guild_id=? AND discord_user_id=?",
+            (guild.id, discord_user_id)
+        ) as cur:
+            row2 = await cur.fetchone()
+        if not row2:
+            await db.execute(
+                "INSERT INTO user_xp (guild_id, discord_user_id, xp) VALUES (?, ?, ?)",
+                (guild.id, discord_user_id, 0)
+            )
+            await db.commit()
+            old_xp = 0
+        else:
+            old_xp = int(row2[0])
+
+    new_xp = old_xp + xp_gain
+    old_rank, old_idx = _rank_for_xp(old_xp)
+    new_rank, new_idx = _rank_for_xp(new_xp)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE user_xp SET xp=? WHERE guild_id=? AND discord_user_id=?",
+            (new_xp, guild.id, discord_user_id)
+        )
+        await db.commit()
+
+    if new_idx > old_idx:
+        member = guild.get_member(discord_user_id) or await guild.fetch_member(discord_user_id)
+        if member:
+            cfg = await get_guild_cfg(guild.id)
+            ch = guild.get_channel(cfg.get("channel_id")) or guild.system_channel
+            if ch:
+                await ch.send(f"🏅 {member.mention} ranked up! **{old_rank} → {new_rank}** (XP: {new_xp:,})")
+
 # ------------------- TikTok Handling -------------------
 def _user_id_from_event_user(u) -> str:
-    """
-    TikTokLive changed field names across versions:
-    - old: u.uniqueId
-    - new: u.unique_id
-    Fallbacks: u.nickname or str(u.id) if present.
-    """
     for attr in ("uniqueId", "unique_id", "username"):
         if hasattr(u, attr):
             val = getattr(u, attr)
@@ -319,29 +404,22 @@ async def start_tiktok(guild: discord.Guild):
     await stop_tiktok(guild)
 
     try:
-        # Create client in a supported way, then *inject* the session cookie if provided.
         client = TikTokLiveClient(unique_id=username)
-
         sess = TIKTOK_SESSIONID
         if sess:
             try:
-                # Try common internal clients to set cookie
                 http = getattr(client, "http", None) or getattr(client, "_client", None)
-                # httpx-style
                 if http and hasattr(http, "cookies"):
                     try:
                         http.cookies.set("sessionid", sess, domain=".tiktok.com")
                     except Exception:
                         http.cookies.set("sessionid", sess)
-                # aiohttp-style
                 elif http and hasattr(http, "cookie_jar"):
                     try:
                         http.cookie_jar.update_cookies({"sessionid": sess}, response_url="https://www.tiktok.com/")
                     except Exception:
                         http.cookie_jar.update_cookies({"sessionid": sess})
-                # Header fallback
                 if hasattr(client, "headers") and isinstance(client.headers, dict):
-                    # ensure we don't clobber other cookies
                     base = client.headers.get("cookie", "").strip()
                     add = f"sessionid={sess}"
                     if base:
@@ -350,7 +428,6 @@ async def start_tiktok(guild: discord.Guild):
                     else:
                         client.headers["cookie"] = add
             except Exception:
-                # last-resort header injection
                 if hasattr(client, "headers") and isinstance(client.headers, dict):
                     client.headers["cookie"] = f"sessionid={sess}"
     except Exception as e:
@@ -382,12 +459,18 @@ async def start_tiktok(guild: discord.Guild):
     async def on_gift(event: GiftEvent):
         try:
             user = _user_id_from_event_user(event.user)
-            amount = int(getattr(event.gift, "repeatCount", 1) or 1)
+            repeat = int(getattr(event.gift, "repeatCount", 1) or 1)
+            diamonds = getattr(event.gift, "diamond_count", None) or getattr(event.gift, "diamondCount", None)
+            amount = repeat
             live_gifters[guild.id][user] = live_gifters[guild.id].get(user, 0) + amount
+
+            xp_gain = (diamonds if (isinstance(diamonds, int) and diamonds > 0) else DEFAULT_XP_PER_GIFT) * repeat
+            asyncio.create_task(_award_xp_for_tiktok_user(guild, user, xp_gain))
+
             if DEBUG_TIKTOK:
                 ch = guild.get_channel(channel_id)
                 if ch:
-                    await ch.send(f"[debug] gift from @{user} (+{amount})")
+                    await ch.send(f"[debug] gift from @{user} (+{amount}) xp+{xp_gain}")
         except Exception as e:
             ch = guild.get_channel(channel_id)
             if ch and DEBUG_TIKTOK:
@@ -465,7 +548,7 @@ async def start_tiktok(guild: discord.Guild):
         if channel:
             cc_img = draw_creators_connections_template(gifts_display, taps_display)
             await channel.send(
-                "🧠 **Creators Connections — Last LIVE**\nLeft: Top Gifters • Right: Top Tappers",
+                POST_LIVE_MESSAGE,
                 file=discord.File(io.BytesIO(cc_img), filename="creators_connections.png")
             )
 
@@ -499,16 +582,28 @@ async def stop_tiktok(guild: discord.Guild):
             pass
         running_clients.pop(guild.id, None)
 
-# ------------------- Weekly Summary + Sore Finger -------------------
+# ------------------- Weekly Summary (fixed) + Sore Finger -------------------
 async def compute_weekly_lists(guild_id: int, start: datetime, end: datetime):
-    """Return (gifts_sorted, likes_sorted) limited to sessions in the week window."""
+    """
+    Returns (gifts_sorted, likes_sorted) for sessions that OVERLAP [start, end].
+    Also merges in-memory tallies for any currently running session so we never post blank.
+    """
+    gifts: Dict[str, int] = {}
+    likes: Dict[str, int] = {}
+
+    # DB totals for overlapping sessions
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT id FROM live_session WHERE guild_id=? AND started_at>=? AND (ended_at<=? OR ended_at IS NULL)",
-            (guild_id, start.isoformat(), end.isoformat())
+            """
+            SELECT id FROM live_session
+            WHERE guild_id=?
+              AND started_at <= ?
+              AND (ended_at IS NULL OR ended_at >= ?)
+            """,
+            (guild_id, end.isoformat(), start.isoformat())
         ) as cur:
             sids = [row[0] for row in await cur.fetchall()]
-        gifts, likes = {}, {}
+
         if sids:
             qmarks = ",".join(["?"] * len(sids))
             async with db.execute(
@@ -516,16 +611,25 @@ async def compute_weekly_lists(guild_id: int, start: datetime, end: datetime):
                 sids
             ) as cur:
                 for u, total in await cur.fetchall():
-                    gifts[u] = int(total)
+                    gifts[u] = gifts.get(u, 0) + int(total or 0)
             async with db.execute(
                 f"SELECT tiktok_user, SUM(count) FROM live_like WHERE session_id IN ({qmarks}) GROUP BY tiktok_user",
                 sids
             ) as cur:
                 for u, total in await cur.fetchall():
-                    likes[u] = int(total)
-        gifts_sorted = sorted(gifts.items(), key=lambda x: x[1], reverse=True)
-        likes_sorted = sorted(likes.items(), key=lambda x: x[1], reverse=True)
-        return gifts_sorted, likes_sorted
+                    likes[u] = likes.get(u, 0) + int(total or 0)
+
+    # Merge current in-memory tallies (covers ongoing live or missed flush)
+    gifts_live = live_gifters.get(guild_id, {})
+    likes_live = live_likers.get(guild_id, {})
+    for u, c in gifts_live.items():
+        gifts[u] = gifts.get(u, 0) + int(c)
+    for u, c in likes_live.items():
+        likes[u] = likes.get(u, 0) + int(c)
+
+    gifts_sorted = sorted(gifts.items(), key=lambda x: x[1], reverse=True)
+    likes_sorted = sorted(likes.items(), key=lambda x: x[1], reverse=True)
+    return gifts_sorted, likes_sorted
 
 async def post_weekly_summary(guild_id: int):
     guild = bot.get_guild(guild_id)
@@ -541,6 +645,7 @@ async def post_weekly_summary(guild_id: int):
 
     gifts, likes = await compute_weekly_lists(guild_id, start, end)
 
+    # name resolution
     async def resolve_names(pairs):
         out = []
         async with aiosqlite.connect(DB_PATH) as db:
@@ -566,7 +671,7 @@ async def post_weekly_summary(guild_id: int):
         "📅 **Creators Connections — Weekly Summary**\nLeft: Top Gifters • Right: Top Tappers",
         file=discord.File(io.BytesIO(img), filename="creators_connections_weekly.png")
     )
-    await ch.send("🔗 Reminder: Link your TikTok with `/tokconnect your_tiktok_name` so we can match your Discord and rank you on the board!")
+    await ch.send("🔗 Link your TikTok with `/tokconnect your_tiktok_name` (without @) to get ranked!")
 
     if likes:
         top_tiktok = likes[0][0]
@@ -585,17 +690,152 @@ async def post_weekly_summary(guild_id: int):
                     sysch = guild.system_channel or ch
                     await sysch.send(f"🖐️ {winner.mention} now has sore fingers!")
 
-async def weekly_scheduler():
+# ------------------- Monthly XP Tally -------------------
+async def post_monthly_xp_tally(guild_id: int):
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return
+    cfg = await get_guild_cfg(guild_id)
+    ch = guild.get_channel(cfg.get("channel_id")) or guild.system_channel
+    if ch is None:
+        return
+
+    # dedupe check
+    tz = pytz.timezone(cfg.get("timezone", DEFAULT_TZ))
+    stamp = yyyymm(datetime.now(tz))
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM monthly_posted WHERE guild_id=? AND yyyymm=?",
+            (guild_id, stamp)
+        ) as cur:
+            if await cur.fetchone():
+                return  # already posted this month
+        await db.execute("INSERT OR IGNORE INTO monthly_posted (guild_id, yyyymm) VALUES (?, ?)", (guild_id, stamp))
+        await db.commit()
+
+    # Load all XP and group by rank
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT discord_user_id, xp FROM user_xp WHERE guild_id=? ORDER BY xp DESC",
+            (guild_id,)
+        ) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        await ch.send("📊 **Monthly XP Tally** — No data yet.")
+        return
+
+    groups: Dict[str, List[Tuple[int, int]]] = {}
+    for uid, xp in rows:
+        rank, _ = _rank_for_xp(int(xp or 0))
+        groups.setdefault(rank, []).append((int(uid), int(xp)))
+
+    # order ranks by RANKS array
+    rank_order = [name for name, _ in RANKS]
+    header = "📊 **Monthly XP Tally** — Everyone by current rank"
+    await ch.send(header)
+
+    for rank_name in rank_order:
+        members = groups.get(rank_name, [])
+        if not members:
+            continue
+        # build chunked messages to respect 2000-char limit
+        lines = [f"**{rank_name}**"]
+        current_block = ""
+        for uid, xp in members:
+            member = guild.get_member(uid) or (await guild.fetch_member(uid) if guild.get_member(uid) is None else None)
+            label = member.display_name if member else f"<@{uid}>"
+            entry = f"- {label} — {xp:,} XP\n"
+            if len(current_block) + len(entry) > 1800:  # start a new message
+                await ch.send("\n".join(lines) + "\n" + f"```{current_block}```")
+                lines = [f"**{rank_name}** (cont.)"]
+                current_block = entry
+            else:
+                current_block += entry
+        if current_block:
+            await ch.send("\n".join(lines) + "\n" + f"```{current_block}```")
+
+# ------------------- Health / Uptime auto-start -------------------
+async def _is_tiktok_live(username: str) -> bool:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+        "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
+    }
+    cookies = {}
+    if TIKTOK_SESSIONID:
+        cookies["sessionid"] = TIKTOK_SESSIONID
+
+    timeout = ClientTimeout(total=6)
+    async with ClientSession(headers=headers, cookies=cookies, timeout=timeout) as session:
+        try:
+            url = f"https://www.tiktok.com/api/live/detail/?aid=1988&uniqueId={username}"
+            async with session.get(url) as r:
+                txt = await r.text()
+                low = txt.lower()
+                if '"islive":true' in low or '"status":1' in low or '"live_room_id"' in low:
+                    return True
+        except Exception:
+            pass
+        try:
+            url2 = f"https://www.tiktok.com/@{username}"
+            async with session.get(url2) as r2:
+                page = (await r2.text()).lower()
+                if '"islive":true' in page or '"roomid":"' in page or '"live_room_id"' in page:
+                    return True
+        except Exception:
+            pass
+    return False
+
+async def _health_tick():
+    for guild in list(bot.guilds):
+        try:
+            cfg = await get_guild_cfg(guild.id)
+            username = (cfg.get("tiktok_username") or "").strip().lstrip("@")
+            if not username:
+                continue
+            if running_clients.get(guild.id):
+                continue
+            prev = _last_auto_start.get(guild.id, 0.0)
+            if time.time() - prev < 90:
+                continue
+            if await _is_tiktok_live(username):
+                _last_auto_start[guild.id] = time.time()
+                await start_tiktok(guild)
+        except Exception:
+            pass
+
+async def _ok(_: web.Request) -> web.Response:
+    asyncio.create_task(_health_tick())
+    return web.Response(text="ok")
+
+async def start_keepalive():
+    app = web.Application()
+    app.add_routes([web.get("/", _ok), web.get("/health", _ok)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+    await site.start()
+    print(f"Keep-alive server running on 0.0.0.0:{PORT}")
+
+# ------------------- Schedulers -------------------
+async def scheduler():
     await bot.wait_until_ready()
     while not bot.is_closed():
         for guild in bot.guilds:
             cfg = await get_guild_cfg(guild.id)
             tz = pytz.timezone(cfg.get("timezone", DEFAULT_TZ))
             now = datetime.now(tz)
+
+            # Weekly summary
             if (now.isoweekday() == (cfg.get("weekly_day") or 6)
                 and now.hour == (cfg.get("weekly_hour") or 19)
                 and now.minute == (cfg.get("weekly_minute") or 0)):
                 await post_weekly_summary(guild.id)
+
+            # Monthly XP tally — 1st @ 12:00
+            if (now.day == 1 and now.hour == 12 and now.minute == 0):
+                await post_monthly_xp_tally(guild.id)
+
         await asyncio.sleep(60)
 
 # ------------------- Commands -------------------
@@ -692,7 +932,6 @@ async def backscan(interaction: discord.Interaction, limit: app_commands.Range[i
         lines.append(f"• {member.display_name}: " + ", ".join(f"@{h}" for h in sorted(handles)))
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 
-# Test image command (dummy data)
 @tree.command(name="cc_test_image", description="(Admin) Post a test leaderboard with dummy data")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def cc_test_image(interaction: discord.Interaction):
@@ -705,7 +944,6 @@ async def cc_test_image(interaction: discord.Interaction):
         file=discord.File(io.BytesIO(img_bytes), filename="creators_connections_TEST.png"),
     )
 
-# NEW: Live status/debug
 @tree.command(name="cc_status", description="Show TikTok tracking status & current tallies")
 async def cc_status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
@@ -721,19 +959,16 @@ async def cc_status(interaction: discord.Interaction):
     )
 
 # ------------------- Keep-Alive Web Server -------------------
-async def _ok(_: web.Request) -> web.Response:
-    return web.Response(text="ok")
-
 async def start_keepalive():
     app = web.Application()
-    app.add_routes([web.get("/", _ok), web.get("/health", _ok)])
+    app.add_routes([web.get("/", lambda r: _ok(r)), web.get("/health", lambda r: _ok(r))])
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
     await site.start()
     print(f"Keep-alive server running on 0.0.0.0:{PORT}")
 
-# ------------------- Lifecycle & Role bootstrap -------------------
+# ------------------- Lifecycle -------------------
 @bot.event
 async def on_member_join(member: discord.Member):
     try:
@@ -761,7 +996,7 @@ async def on_ready():
         await ensure_named_role(g, "Sore Finger")
         await ensure_named_role(g, "Top Gifter")
     await tree.sync()
-    asyncio.create_task(weekly_scheduler())
+    asyncio.create_task(scheduler())
     asyncio.create_task(start_keepalive())
     print(f"Logged in as {bot.user}")
 
@@ -770,3 +1005,4 @@ if __name__ == "__main__":
         raise SystemExit("❌ Missing DISCORD_BOT_TOKEN in environment")
     print("DISCORD_BOT_TOKEN loaded?", bool(BOT_TOKEN))
     bot.run(BOT_TOKEN)
+
